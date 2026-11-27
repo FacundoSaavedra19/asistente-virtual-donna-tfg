@@ -79,13 +79,16 @@ async function serverErrorMessage(response: Response): Promise<string> {
   return `El servidor no pudo procesar la petición (código ${response.status}).`
 }
 
-export async function askDonna(
-  blob: Blob,
-  options: DonnaRequestOptions
-): Promise<DonnaResponse> {
-  const formData = new FormData()
-  formData.append('audio', blob, audioFileName(blob.type))
-
+/**
+ * Petición HTTP común a los endpoints JSON: timeout, cancelación externa
+ * y traducción de los fallos a DonnaApiError. Devuelve el JSON sin validar.
+ */
+async function requestJson(
+  url: URL,
+  init: RequestInit,
+  options: DonnaRequestOptions,
+  timeoutMessage: string
+): Promise<unknown> {
   const controller = new AbortController()
   let timedOut = false
   const timer = setTimeout(() => {
@@ -98,21 +101,14 @@ export async function askDonna(
   options.signal?.addEventListener('abort', onExternalAbort)
 
   const abortError = () => timedOut
-    ? new DonnaApiError(
-        'timeout',
-        'Donna tarda demasiado en responder. Inténtalo de nuevo.'
-      )
+    ? new DonnaApiError('timeout', timeoutMessage)
     : new DonnaApiError('cancelled', 'Petición cancelada.')
 
   try {
     let response: Response
 
     try {
-      response = await fetch(new URL('/api/ask', options.baseUrl), {
-        method: 'POST',
-        body: formData,
-        signal: controller.signal
-      })
+      response = await fetch(url, { ...init, signal: controller.signal })
     } catch {
       if (controller.signal.aborted) throw abortError()
       throw new DonnaApiError(
@@ -130,28 +126,165 @@ export async function askDonna(
       )
     }
 
-    let data: unknown
     try {
-      data = await response.json()
+      return await response.json()
     } catch {
       if (controller.signal.aborted) throw abortError()
-      throw new DonnaApiError(
-        'invalid-response',
-        'La respuesta del servidor no tiene un formato válido.'
-      )
+      throw invalidResponse()
     }
-
-    if (typeof data !== 'object' || data === null || Array.isArray(data)) {
-      throw new DonnaApiError(
-        'invalid-response',
-        'La respuesta del servidor no tiene un formato válido.'
-      )
-    }
-
-    return data as DonnaResponse
   } finally {
     clearTimeout(timer)
     options.signal?.removeEventListener('abort', onExternalAbort)
+  }
+}
+
+function invalidResponse(): DonnaApiError {
+  return new DonnaApiError(
+    'invalid-response',
+    'La respuesta del servidor no tiene un formato válido.'
+  )
+}
+
+export async function askDonna(
+  blob: Blob,
+  options: DonnaRequestOptions
+): Promise<DonnaResponse> {
+  const formData = new FormData()
+  formData.append('audio', blob, audioFileName(blob.type))
+
+  const data = await requestJson(
+    new URL('/api/ask', options.baseUrl),
+    { method: 'POST', body: formData },
+    options,
+    'Donna tarda demasiado en responder. Inténtalo de nuevo.'
+  )
+
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+    throw invalidResponse()
+  }
+
+  return data as DonnaResponse
+}
+
+// ---------------------------------------------------------------------------
+// Historial: GET /api/history?limit=N (backend/main.py y donna/history.py)
+// Devuelve un array con las filas de la tabla `interaccion`, de la más
+// reciente a la más antigua. Los nombres de los campos son los de SQLite.
+// ---------------------------------------------------------------------------
+
+export interface DonnaHistoryEntry {
+  id: number
+  /** ISO 8601 sin zona horaria, hora local del servidor (p. ej. 2026-11-27T18:19:05). */
+  fecha_hora: string
+  idioma: string
+  pregunta: string
+  respuesta: string
+  /** Hoy el backend siempre lo guarda como null. */
+  comando_id: number | null
+  /** Solo el nombre del archivo (sin /audio/). */
+  archivo_audio: string | null
+  t_transcripcion_ms: number | null
+  t_sintesis_ms: number | null
+  t_total_ms: number
+  /** Hoy siempre "ok": los errores de /api/ask no se registran. */
+  estado: string
+  mensaje_error: string | null
+}
+
+export const HISTORY_DEFAULT_LIMIT = 20
+export const HISTORY_MAX_LIMIT = 100
+
+export interface DonnaHistoryOptions extends DonnaRequestOptions {
+  limit?: number
+}
+
+/** Limita `limit` a un entero entre 1 y HISTORY_MAX_LIMIT. */
+export function normalizeHistoryLimit(limit: unknown): number {
+  const value = typeof limit === 'number' ? Math.trunc(limit) : NaN
+  if (!Number.isFinite(value)) return HISTORY_DEFAULT_LIMIT
+  return Math.min(Math.max(value, 1), HISTORY_MAX_LIMIT)
+}
+
+function parseHistoryEntry(raw: unknown): DonnaHistoryEntry | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null
+  const row = raw as Record<string, unknown>
+
+  const str = (v: unknown) => typeof v === 'string' ? v : null
+  const num = (v: unknown) =>
+    typeof v === 'number' && Number.isFinite(v) ? v : null
+
+  const id = num(row.id)
+  const fecha = str(row.fecha_hora)
+  const pregunta = str(row.pregunta)
+  const respuesta = str(row.respuesta)
+  const total = num(row.t_total_ms)
+
+  // Columnas NOT NULL del esquema: sin ellas la fila no se puede mostrar.
+  if (id === null || fecha === null || pregunta === null ||
+      respuesta === null || total === null) {
+    return null
+  }
+
+  return {
+    id,
+    fecha_hora: fecha,
+    idioma: str(row.idioma) ?? 'es',
+    pregunta,
+    respuesta,
+    comando_id: num(row.comando_id),
+    archivo_audio: str(row.archivo_audio),
+    t_transcripcion_ms: num(row.t_transcripcion_ms),
+    t_sintesis_ms: num(row.t_sintesis_ms),
+    t_total_ms: total,
+    estado: str(row.estado) ?? 'ok',
+    mensaje_error: str(row.mensaje_error)
+  }
+}
+
+/**
+ * Valida la respuesta de /api/history. Lanza DonnaApiError si no es un array
+ * y descarta las filas mal formadas en lugar de romper toda la vista.
+ */
+export function parseHistory(raw: unknown): DonnaHistoryEntry[] {
+  if (!Array.isArray(raw)) throw invalidResponse()
+  return raw
+    .map(parseHistoryEntry)
+    .filter((entry): entry is DonnaHistoryEntry => entry !== null)
+}
+
+export async function fetchHistory(
+  options: DonnaHistoryOptions
+): Promise<DonnaHistoryEntry[]> {
+  const url = new URL('/api/history', options.baseUrl)
+  url.searchParams.set('limit', String(normalizeHistoryLimit(options.limit)))
+
+  const data = await requestJson(
+    url,
+    { method: 'GET', headers: { Accept: 'application/json' } },
+    options,
+    'El historial tarda demasiado en cargar. Inténtalo de nuevo.'
+  )
+
+  return parseHistory(data)
+}
+
+// Nombres generados por el backend: <uuid hex>.wav. Se admite cualquier nombre
+// simple con extensión de audio, nunca rutas (/, \, ..).
+const HISTORY_AUDIO_NAME = /^[A-Za-z0-9_-]+\.(wav|mp3|m4a|webm|ogg)$/i
+
+/**
+ * URL absoluta del audio de una interacción, o null si no tiene audio
+ * o el nombre no es seguro. El archivo puede no existir ya en el servidor.
+ */
+export function getHistoryAudioUrl(
+  archivoAudio: string | null,
+  baseUrl: string
+): string | null {
+  if (!archivoAudio || !HISTORY_AUDIO_NAME.test(archivoAudio)) return null
+  try {
+    return getDonnaAudioUrl(`/audio/${archivoAudio}`, baseUrl)
+  } catch {
+    return null
   }
 }
 

@@ -50,6 +50,15 @@ const processing = ref(false)
 const chatContainer = ref<HTMLElement | null>(null)
 let nextMessageId = 2
 
+function scrollChatToBottom() {
+  void nextTick(() => {
+    if (chatContainer.value) {
+      chatContainer.value.scrollTop =
+        chatContainer.value.scrollHeight
+    }
+  })
+}
+
 function addMessage(role: Message['role'], text: string) {
   messages.value.push({
     id: nextMessageId++,
@@ -57,12 +66,44 @@ function addMessage(role: Message['role'], text: string) {
     text
   })
 
-  void nextTick(() => {
-    if (chatContainer.value) {
-      chatContainer.value.scrollTop =
-        chatContainer.value.scrollHeight
-    }
-  })
+  scrollChatToBottom()
+}
+
+// Pestañas del panel derecho. Ambos paneles se ocultan con v-show, así que
+// no se desmontan y el avatar 3D (en el panel izquierdo) no se ve afectado.
+type PanelTab = 'chat' | 'history'
+
+const panelTabs: { id: PanelTab; label: string }[] = [
+  { id: 'chat', label: 'Conversación' },
+  { id: 'history', label: 'Historial' }
+]
+
+const activeTab = ref<PanelTab>('chat')
+// Se incrementa tras cada respuesta real para que el historial se recargue.
+const historyVersion = ref(0)
+
+function selectTab(tab: PanelTab) {
+  activeTab.value = tab
+  // Con el panel oculto el scroll no se aplica: se repite al volver.
+  if (tab === 'chat') scrollChatToBottom()
+}
+
+// Navegación con teclado del patrón ARIA "tabs" (activación automática).
+function onTabKeydown(event: KeyboardEvent, index: number) {
+  const last = panelTabs.length - 1
+  const targets: Partial<Record<string, number>> = {
+    ArrowRight: index === last ? 0 : index + 1,
+    ArrowLeft: index === 0 ? last : index - 1,
+    Home: 0,
+    End: last
+  }
+  const next = targets[event.key]
+
+  if (next === undefined) return
+  event.preventDefault()
+  const tab = panelTabs[next]!.id
+  selectTab(tab)
+  document.getElementById(`tab-${tab}`)?.focus()
 }
 
 const demoMode = ref(
@@ -199,6 +240,9 @@ async function handleRecording(blob: Blob) {
 
       if (turn.question) addMessage('user', turn.question)
       if (turn.answer) addMessage('assistant', turn.answer)
+
+      // El backend ya ha guardado la interacción en SQLite.
+      historyVersion.value++
 
       visemes.value = turn.visemes
       donnaAudioUrl.value = turn.audioUrl
@@ -345,9 +389,25 @@ useHead({
           </div>
         </section>
 
-        <section class="chat-panel" aria-label="Conversación">
+        <section class="chat-panel" aria-label="Conversación e historial">
           <div class="chat-header">
-            <h2>Conversación</h2>
+            <div class="panel-tabs" role="tablist" aria-label="Paneles">
+              <button
+                v-for="(tab, index) in panelTabs"
+                :id="`tab-${tab.id}`"
+                :key="tab.id"
+                type="button"
+                role="tab"
+                :aria-selected="activeTab === tab.id"
+                :aria-controls="`panel-${tab.id}`"
+                :tabindex="activeTab === tab.id ? 0 : -1"
+                :class="{ active: activeTab === tab.id }"
+                @click="selectTab(tab.id)"
+                @keydown="onTabKeydown($event, index)"
+              >
+                {{ tab.label }}
+              </button>
+            </div>
             <div class="api-mode">
               <label for="demo-mode">Modo demo</label>
               <input id="demo-mode" v-model="demoMode"
@@ -356,24 +416,48 @@ useHead({
           </div>
 
           <div
-            ref="chatContainer"
-            class="chat-messages"
-            role="log"
-            aria-live="polite"
-            aria-relevant="additions"
-            aria-label="Mensajes de la conversación"
+            v-show="activeTab === 'chat'"
+            id="panel-chat"
+            class="tab-panel"
+            role="tabpanel"
+            aria-labelledby="tab-chat"
           >
             <div
-              v-for="message in messages"
-              :key="message.id"
-              class="message"
-              :class="message.role"
+              ref="chatContainer"
+              class="chat-messages"
+              role="log"
+              aria-live="polite"
+              aria-relevant="additions"
+              aria-label="Mensajes de la conversación"
             >
-              <span class="sr-only">
-                {{ message.role === 'user' ? 'Tú: ' : 'Donna: ' }}
-              </span>
-              {{ message.text }}
+              <div
+                v-for="message in messages"
+                :key="message.id"
+                class="message"
+                :class="message.role"
+              >
+                <span class="sr-only">
+                  {{ message.role === 'user' ? 'Tú: ' : 'Donna: ' }}
+                </span>
+                {{ message.text }}
+              </div>
             </div>
+          </div>
+
+          <div
+            v-show="activeTab === 'history'"
+            id="panel-history"
+            class="tab-panel"
+            role="tabpanel"
+            aria-labelledby="tab-history"
+          >
+            <DonnaHistory
+              :base-url="apiBase"
+              :timeout-ms="apiTimeoutMs"
+              :demo-mode="demoMode"
+              :active="activeTab === 'history'"
+              :version="historyVersion"
+            />
           </div>
 
           <div class="chat-footer">
@@ -675,10 +759,53 @@ button {
   padding: 20px;
 }
 
-.chat-header h2 {
-  font-size: 18px;
+.chat-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.panel-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.panel-tabs button {
+  border: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  background: transparent;
+  color: var(--muted);
+  padding: 8px 12px;
+  font-size: 15px;
   font-weight: 600;
-  margin: 0 0 20px;
+  cursor: pointer;
+}
+
+.panel-tabs button:hover {
+  color: var(--text);
+}
+
+.panel-tabs button.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+.panel-tabs button:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 6px 6px 0 0;
+}
+
+.tab-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .chat-messages {
@@ -795,7 +922,6 @@ button {
   display: flex;
   align-items: center;
   gap: 9px;
-  margin-top: 12px;
   color: var(--muted);
   font-size: 12px;
 }
